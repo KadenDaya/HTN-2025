@@ -1,0 +1,6 @@
+*.env
+*.key
+**/__pycache__
+/env
+secrets.yaml
+secrets.jason
