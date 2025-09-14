@@ -11,7 +11,7 @@ export async function POST(request: NextRequest) {
     const authorization = request.headers.get('authorization');
     
     // Forward the request to the FastAPI backend
-    const response = await fetch(`${BACKEND_URL}/api/v1/statements/upload`, {
+    const response = await fetch(`${BACKEND_URL}/upload`, {
       method: 'POST',
       headers: {
         ...(authorization && { 'Authorization': authorization }),

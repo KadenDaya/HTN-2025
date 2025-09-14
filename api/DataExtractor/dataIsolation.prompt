@@ -80,7 +80,7 @@ Your task:
       "transaction_date": "2025-08-18",
       "post_date": "2025-08-19",
       "description": "THE CITY OF GUELPH - TRAN GUELPH ON",
-      "amount": -2.85,
+      "amount": 2.85,
       "location": "GUELPH ON"
     },
     {
@@ -88,7 +88,7 @@ Your task:
       "transaction_date": "2025-08-18",
       "post_date": "2025-08-20",
       "description": "PRESTO FARE/PRPHXRW76T TORONTO ON",
-      "amount": -27.18,
+      "amount": 27.18,
       "location": "TORONTO ON"
     }
   ],

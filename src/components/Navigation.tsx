@@ -4,7 +4,7 @@ import { useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { Button } from "@/components/ui/button";
-import { TrendingUp, PieChart, Target, Menu, X, Upload } from "lucide-react";
+import { TrendingUp, PieChart, Target, Menu, X, Upload, Database } from "lucide-react";
 
 const Navigation = () => {
   const [isOpen, setIsOpen] = useState(false);
@@ -14,6 +14,7 @@ const Navigation = () => {
     { name: "Dashboard", path: "/dashboard", icon: PieChart },
     { name: "Investments", path: "/investments", icon: Target },
     { name: "Trends", path: "/trends", icon: TrendingUp },
+    { name: "Databricks", path: "/databricks", icon: Database },
   ];
 
   const isActive = (path: string) => pathname === path;

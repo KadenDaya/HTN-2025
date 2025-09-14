@@ -123,12 +123,14 @@ export default function PlanningPage() {
       // Fallback to basic calculation if API fails
       const incomeNum = parseInt(monthlyIncome.replace(/[^0-9]/g, ""));
       const rentNum = parseInt(monthlyRent.replace(/[^0-9]/g, ""));
-      const disposableIncome = incomeNum - rentNum;
+      const creditCardNum = incomeNum * 0.15; // Estimate 15% of income for credit cards
+      const disposableIncome = incomeNum - rentNum - creditCardNum;
       const monthlySavings = disposableIncome * 0.3;
       const totalContributions = monthlySavings * 60; // 5 years
       const fallbackResults = {
         monthly_income: incomeNum,
         monthly_rent: rentNum,
+        monthly_credit_card: creditCardNum,
         disposable_income: disposableIncome,
         monthly_savings: monthlySavings,
         investment_period_years: 5,
@@ -269,7 +271,7 @@ export default function PlanningPage() {
                             </div>
                             <div className="text-sm text-white/70 mb-1">Monthly Savings</div>
                             <div className="text-xs text-white/50">
-                              Based on ${analysisResults.disposable_income?.toLocaleString()} disposable income
+                              After rent (${analysisResults.monthly_rent?.toLocaleString()}) & credit cards (${analysisResults.monthly_credit_card?.toLocaleString()})
                             </div>
                           </div>
                           
@@ -296,11 +298,11 @@ export default function PlanningPage() {
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                           <div className="bg-orange-500/20 border border-orange-400/30 rounded-xl p-6 text-center">
                             <div className="text-3xl font-bold text-orange-400 mb-2">
-                              ${((analysisResults.monthly_savings || 0) + (analysisResults.monthly_income || 0) * 0.125).toLocaleString()}
+                              ${((analysisResults.monthly_savings || 0) + (analysisResults.monthly_credit_card || 0) * 0.3).toLocaleString()}
                             </div>
-                            <div className="text-sm text-white/70 mb-1">Monthly Savings with cutting out Uber Eats </div>
+                            <div className="text-sm text-white/70 mb-1">Monthly Savings by reducing credit card spending by 30%</div>
                             <div className="text-xs text-white/50">
-                              +${((analysisResults.monthly_income || 0) * 0.125).toLocaleString()}/month extra savings
+                              +${((analysisResults.monthly_credit_card || 0) * 0.3).toLocaleString()}/month extra savings
                             </div>
                           </div>
 
@@ -329,6 +331,15 @@ export default function PlanningPage() {
                           <div className="flex justify-between">
                             <span className="text-white/70">Monthly Rent:</span>
                             <span className="text-white font-medium">${analysisResults.monthly_rent?.toLocaleString()}</span>
+                          </div>
+                          <div className="flex justify-between">
+                            <span className="text-white/70">Credit Card Spending:</span>
+                            <div className="text-right">
+                              <span className="text-white font-medium">${analysisResults.monthly_credit_card?.toLocaleString()}</span>
+                              <div className="text-xs text-white/50">
+                                {analysisResults.credit_card_data_source || "From statements"}
+                              </div>
+                            </div>
                           </div>
                           <div className="flex justify-between">
                             <span className="text-white/70">Disposable Income:</span>
@@ -426,6 +437,9 @@ export default function PlanningPage() {
               <div className="text-center mb-6">
                 <h3 className="text-xl font-bold text-white mb-2">🏠 House Analysis</h3>
                 <p className="text-sm text-white/70">Quick financial assessment</p>
+                <div className="mt-2 px-3 py-1 bg-blue-500/20 border border-blue-400/30 rounded-lg">
+                  <p className="text-xs text-blue-300">💳 Credit card spending will be automatically pulled from your uploaded statements</p>
+                </div>
               </div>
               
               <div className="space-y-4">
@@ -490,6 +504,7 @@ export default function PlanningPage() {
                     />
                   </div>
                 </div>
+
 
                 {/* Risk Tolerance - Compact Options Bar */}
                 <div>

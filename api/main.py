@@ -2,10 +2,10 @@ from fastapi import FastAPI, Depends, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
-from api.auth import auth_required
 from datetime import datetime
 from DataExtractor.DataExtractor import extract_data
-from db.main import Database, UserRepository, StatementRepository
+import json
+import re
 import sys
 import os
 
@@ -13,18 +13,68 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from rbcAPIWrapper import InvestEasyAPI
 
+# Try to import optional dependencies
+try:
+    from api.auth import auth_required
+    AUTH_AVAILABLE = True
+except ImportError:
+    print("⚠️ Auth module not available, running without authentication")
+    AUTH_AVAILABLE = False
+    # Create dummy auth_required decorator
+    def auth_required():
+        def decorator(func):
+            def wrapper(*args, **kwargs):
+                # Return a dummy user for compatibility
+                return func(*args, **kwargs, user={"sub": "demo_user", "email": "demo@example.com"})
+            return wrapper
+        return decorator
+
+try:
+    from db.main import Database, UserRepository, StatementRepository
+    DB_AVAILABLE = True
+except ImportError:
+    print("⚠️ Database modules not available")
+    DB_AVAILABLE = False
+
+try:
+    from dbxLoader import upload_statement_to_databricks
+    DATABRICKS_AVAILABLE = True
+except ImportError:
+    print("⚠️ Databricks module not available")
+    DATABRICKS_AVAILABLE = False
+
+try:
+    from sqlite_db import upload_statement_to_sqlite, get_dashboard_data as get_sqlite_dashboard_data, init_database
+    SQLITE_AVAILABLE = True
+except ImportError:
+    print("⚠️ SQLite module not available")
+    SQLITE_AVAILABLE = False
+
+try:
+    from databricks import sql as databricks_sql
+    DATABRICKS_SQL_AVAILABLE = True
+except ImportError:
+    print("⚠️ Databricks SQL module not available")
+    DATABRICKS_SQL_AVAILABLE = False
+
 # Pydantic models
 class HouseAnalysisRequest(BaseModel):
     monthly_income: float
     monthly_rent: float
     risk_tolerance: str
+    user_id: Optional[str] = None  # Optional user ID to fetch credit card data
 
 app = FastAPI()
+
+MAX_BYTES = 2 * 1024 * 1024  # 2 MB demo cap
 
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -47,6 +97,106 @@ def ensure_rbc_authenticated():
         print("RBC API credentials not available")
         return False
 
+def get_user_credit_card_spending(user_id: str) -> float:
+    """Get user's monthly credit card spending from Databricks or SQLite"""
+    
+    # Try Databricks first
+    if DATABRICKS_SQL_AVAILABLE:
+        try:
+            # Databricks configuration
+            DATABRICKS_HOST = os.getenv("DATABRICKS_HOST", "dbc-4583e2a1-3d51.cloud.databricks.com")
+            DATABRICKS_HTTP_PATH = os.getenv("DATABRICKS_HTTP_PATH", "/sql/1.0/warehouses/24e8ffcb0690a53c")
+            DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN", "REPLACE_ME")
+            DATABRICKS_SCHEMA = os.getenv("DATABRICKS_SCHEMA", "finance")
+            
+            with databricks_sql.connect(
+                server_hostname=DATABRICKS_HOST,
+                http_path=DATABRICKS_HTTP_PATH,
+                access_token=DATABRICKS_TOKEN
+            ) as conn:
+                cur = conn.cursor()
+                
+                # Get the most recent statement's purchases (monthly credit card spending)
+                cur.execute(f"""
+                SELECT purchases
+                FROM `{DATABRICKS_SCHEMA}`.`statements`
+                WHERE user_id = ? AND purchases IS NOT NULL
+                ORDER BY statement_date DESC, inserted_at DESC
+                LIMIT 1
+                """, (user_id,))
+                
+                result = cur.fetchone()
+                if result and result[0]:
+                    monthly_spending = float(result[0])
+                    print(f"✅ Found credit card spending from Databricks: ${monthly_spending}")
+                    return monthly_spending
+                    
+        except Exception as e:
+            print(f"❌ Databricks query failed: {e}")
+    
+    # Fallback to SQLite
+    if SQLITE_AVAILABLE:
+        try:
+            from sqlite_db import get_db_connection
+            
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Get the most recent statement's purchases
+                cursor.execute("""
+                SELECT purchases
+                FROM statements
+                WHERE user_id = ? AND purchases IS NOT NULL
+                ORDER BY statement_date DESC, inserted_at DESC
+                LIMIT 1
+                """, (user_id,))
+                
+                result = cursor.fetchone()
+                if result and result[0]:
+                    monthly_spending = float(result[0])
+                    print(f"✅ Found credit card spending from SQLite: ${monthly_spending}")
+                    return monthly_spending
+                    
+        except Exception as e:
+            print(f"❌ SQLite query failed: {e}")
+    
+    # If no data found, return 0 and let user input manually
+    print(f"⚠️ No credit card spending data found for user {user_id}")
+    return 0.0
+
+def _strip_code_fences(s: str) -> str:
+    s = s.strip()
+    # remove ```json ... ``` or ``` ... ``` fences if the model added them
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s)
+        s = re.sub(r"\s*```$", "", s)
+    return s
+
+def parse_model_json(res) -> dict:
+    """
+    Extract JSON payload from a Chat Completions–style response like the one you printed.
+    Falls back to common shapes if the SDK returns a different structure.
+    """
+    # 1) Try classic chat.completions shape
+    try:
+        content = res["choices"][0]["message"]["content"]
+    except Exception:
+        # 2) Some SDKs expose helper properties or 'output_text'
+        content = getattr(res, "output_text", None)
+        if content is None:
+            # 3) Last resort: stringify and try to pull the biggest {...} block
+            content = json.dumps(res)
+
+    if isinstance(content, list):
+        # Some SDKs may return a list of content parts
+        # Join only the text parts
+        content = "".join(part.get("text", "") if isinstance(part, dict) else str(part)
+                          for part in content)
+
+    content = _strip_code_fences(str(content))
+    # Now parse to Python dict
+    return json.loads(content)
+
 @app.get("/")
 def read_root():
     return {"Hello": "World"}
@@ -60,96 +210,161 @@ async def test_upload(file: UploadFile = File(...)):
         "status": "success"
     }
 
-@app.get("/api/v1/me")
-def get_me(user=Depends(auth_required)):
-    return {"id": user["sub"], "email": user.get("email")}
+# Conditional endpoint - only available if auth is available
+if AUTH_AVAILABLE:
+    @app.get("/api/v1/me")
+    def get_me(user=Depends(auth_required)):
+        return {"id": user["sub"], "email": user.get("email")}
 
-@app.post("/api/v1/statements/upload")
-async def upload_statements(file: UploadFile = File(...), user=Depends(auth_required)):
+# Main upload endpoint (from main branch) - works without auth
+@app.post("/upload")
+async def upload(file: UploadFile = File(...)):
+    data = await file.read()
+    if len(data) > MAX_BYTES:
+        raise HTTPException(status_code=413, detail="File too large for demo endpoint")
+
+    res, text = extract_data(data)
+
+    # Convert model string → dict
     try:
-        if file.content_type != "application/pdf":
-            raise HTTPException(status_code=400, detail="Invalid file type")
-        
-        upload_time = datetime.now()
-        pdf = await file.read()
-        
-        # Use the actual AI processing
-        try:
-            enriched, extracted = extract_data(pdf)
-        except Exception as ai_error:
-            print(f"AI processing error: {str(ai_error)}")
-            # Fallback to basic extraction if AI fails
-            extracted = f"Extracted text from {file.filename} (AI processing failed)"
-            enriched = {
-                "summary": "AI processing temporarily unavailable", 
-                "error": str(ai_error),
-                "categories": ["fallback"]
-            }
-        
-        # Create database session and repositories
-        db = Database()
-        user_repo = UserRepository(db)
-        statement_repo = StatementRepository(db)
-        
-        # Ensure user exists in database
-        user_repo.get_or_create(
-            auth0_id=user["sub"],
-            email=user.get("email", ""),
-            name=user.get("name", "")
-        )
-        
-        # Create statement
-        statement = statement_repo.create(user["sub"], upload_time, extracted, enriched)
-        
-        # Extract statement ID before closing session
-        statement_id = statement.id
-        
-        db.close()
-        return {
-            "statement_id": statement_id,
-            "status": "uploaded",
-            "datetime_uploaded": upload_time.isoformat(),
-            "summary": enriched.get("summary") if isinstance(enriched, dict) else None
-        }
+        statement = parse_model_json(res)
     except Exception as e:
-        print(f"Upload error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+        # Helpful diagnostics if parsing fails
+        raise HTTPException(status_code=500, detail=f"Failed to parse model JSON: {e}")
 
-@app.get("/api/v1/statements/list")
-def list_statements(user=Depends(auth_required)):
-    db = Database()
-    statement_repo = StatementRepository(db)
-    statements = statement_repo.list_by_user(user["sub"])
-    db.close()
-    return [
-        {
-            "id": s.id,
-            "status": s.status,
-            "uploaded_at": s.uploaded_at.isoformat(),
-            "summary": s.enriched_data.get("summary") if isinstance(s.enriched_data, dict) else None
-        }
-        for s in statements
-    ]
+    # Pretty-print to logs (optional)
+    print(f"Extracted {len(text)} chars from {file.filename}")
+    print(json.dumps(statement, indent=2, ensure_ascii=False))
+    
+    # Upload to Databricks if available
+    if DATABRICKS_AVAILABLE:
+        try:
+            upload_statement_to_databricks(statement, "1")
+        except Exception as e:
+            print(f"Databricks upload failed: {e}")
 
-@app.get("/api/v1/statements/{id}")
-def get_statement(id: str, user=Depends(auth_required)):
-    db = Database()
-    statement_repo = StatementRepository(db)
-    statement = statement_repo.get_by_id(user["sub"], id)
-    db.close()
-    if not statement:
-        raise HTTPException(status_code=404, detail="Statement not found")
     return {
-        "id": statement.id,
-        "status": statement.status,
-        "uploaded_at": statement.uploaded_at.isoformat(),
-        "text_extracted": statement.text_extracted,
-        "enriched_data": statement.enriched_data
+        "filename": file.filename,
+        "content_preview": text[:500],  # don't blast full text back if large
+        "statement": statement          # ✅ clean JSON object
     }
 
+# Enhanced upload endpoint (from feature branch) - requires auth if available
+if AUTH_AVAILABLE and DB_AVAILABLE:
+    @app.post("/api/v1/statements/upload")
+    async def upload_statements(file: UploadFile = File(...), user=Depends(auth_required)):
+        try:
+            if file.content_type != "application/pdf":
+                raise HTTPException(status_code=400, detail="Invalid file type")
+            
+            upload_time = datetime.now()
+            pdf = await file.read()
+            
+            # Use the actual AI processing
+            try:
+                enriched, extracted = extract_data(pdf)
+            except Exception as ai_error:
+                print(f"AI processing error: {str(ai_error)}")
+                # Fallback to basic extraction if AI fails
+                extracted = f"Extracted text from {file.filename} (AI processing failed)"
+                enriched = {
+                    "summary": "AI processing temporarily unavailable", 
+                    "error": str(ai_error),
+                    "categories": ["fallback"]
+                }
+            
+            # Create database session and repositories
+            db = Database()
+            user_repo = UserRepository(db)
+            statement_repo = StatementRepository(db)
+            
+            # Ensure user exists in database
+            user_repo.get_or_create(
+                auth0_id=user["sub"],
+                email=user.get("email", ""),
+                name=user.get("name", "")
+            )
+            
+            # Create statement
+            statement = statement_repo.create(user["sub"], upload_time, extracted, enriched)
+            
+            # Extract statement ID before closing session
+            statement_id = statement.id
+            
+            db.close()
+            return {
+                "statement_id": statement_id,
+                "status": "uploaded",
+                "datetime_uploaded": upload_time.isoformat(),
+                "summary": enriched.get("summary") if isinstance(enriched, dict) else None
+            }
+        except Exception as e:
+            print(f"Upload error: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+    @app.get("/api/v1/statements/list")
+    def list_statements(user=Depends(auth_required)):
+        db = Database()
+        statement_repo = StatementRepository(db)
+        statements = statement_repo.list_by_user(user["sub"])
+        db.close()
+        return [
+            {
+                "id": s.id,
+                "status": s.status,
+                "uploaded_at": s.uploaded_at.isoformat(),
+                "summary": s.enriched_data.get("summary") if isinstance(s.enriched_data, dict) else None
+            }
+            for s in statements
+        ]
+
+    @app.get("/api/v1/statements/{id}")
+    def get_statement(id: str, user=Depends(auth_required)):
+        db = Database()
+        statement_repo = StatementRepository(db)
+        statement = statement_repo.get_by_id(user["sub"], id)
+        db.close()
+        if not statement:
+            raise HTTPException(status_code=404, detail="Statement not found")
+        return {
+            "id": statement.id,
+            "status": statement.status,
+            "uploaded_at": statement.uploaded_at.isoformat(),
+            "text_extracted": statement.text_extracted,
+            "enriched_data": statement.enriched_data
+        }
+
 @app.post("/api/v1/house-analysis")
-async def analyze_house_buying(request: HouseAnalysisRequest, user=Depends(auth_required)):
+async def analyze_house_buying(request: HouseAnalysisRequest, user=None):
+    """
+    Analyze house buying potential using RBC API integration.
+    User parameter is optional - will be injected if auth is available.
+    """
+    # If auth is available, require it
+    if AUTH_AVAILABLE:
+        if user is None:
+            # This shouldn't happen if auth_required is working, but just in case
+            raise HTTPException(status_code=401, detail="Authentication required")
+    else:
+        # Create a dummy user for compatibility
+        user = {"sub": "demo_user", "email": "demo@example.com"}
+    
     try:
+        # Get credit card spending from Databricks/SQLite if user_id provided
+        monthly_credit_card = 0.0
+        data_source_info = "Manual input"
+        
+        if user and user.get("sub"):
+            monthly_credit_card = get_user_credit_card_spending(user["sub"])
+            if monthly_credit_card > 0:
+                data_source_info = "From uploaded statements"
+        
+        # If no data found and no manual input, use a reasonable default
+        if monthly_credit_card == 0:
+            # Use 15% of income as default credit card spending estimate
+            monthly_credit_card = request.monthly_income * 0.15
+            data_source_info = "Estimated (15% of income)"
+        
         # Map risk tolerance to portfolio types and expected returns
         risk_to_portfolio = {
             "very-aggressive": {"type": "aggressive_growth", "annual_return": 0.12},
@@ -164,7 +379,7 @@ async def analyze_house_buying(request: HouseAnalysisRequest, user=Depends(auth_
         expected_annual_return = portfolio_info["annual_return"]
         
         # Calculate basic financial metrics
-        disposable_income = request.monthly_income - request.monthly_rent
+        disposable_income = request.monthly_income - request.monthly_rent - monthly_credit_card
         
         # Use all disposable income as savings/investment
         # Assumes user has already accounted for all other expenses in their rent/housing costs
@@ -293,10 +508,12 @@ async def analyze_house_buying(request: HouseAnalysisRequest, user=Depends(auth_
                 f"RBC API integration temporarily unavailable - showing calculated estimates",
                 f"Your {portfolio_type.replace('_', ' ')} portfolio strategy aligns with your risk level"
             ])
-
+        
         return {
             "monthly_income": request.monthly_income,
             "monthly_rent": request.monthly_rent,
+            "monthly_credit_card": monthly_credit_card,
+            "credit_card_data_source": data_source_info,
             "disposable_income": disposable_income,
             "monthly_savings": monthly_savings,
             "investment_period_years": 5,
@@ -316,6 +533,41 @@ async def analyze_house_buying(request: HouseAnalysisRequest, user=Depends(auth_
         print(f"Investment analysis error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
+# Apply auth_required decorator if available
+if AUTH_AVAILABLE:
+    # Re-define the endpoint with auth
+    @app.post("/api/v1/house-analysis")
+    async def analyze_house_buying_with_auth(request: HouseAnalysisRequest, user=Depends(auth_required)):
+        return await analyze_house_buying(request, user)
+
 @app.get("/api/v1/dashboard/")
-def get_dashboard(user=Depends(auth_required)):
-    return {"message": "Dashboard endpoint", "user_id": user["sub"]}
+def get_dashboard(user=None):
+    """Dashboard endpoint - auth optional"""
+    if AUTH_AVAILABLE and user is None:
+        # If auth is available but user is None, require auth
+        raise HTTPException(status_code=401, detail="Authentication required")
+    
+    user_id = user["sub"] if user else "demo_user"
+    return {"message": "Dashboard endpoint", "user_id": user_id}
+
+# Apply auth if available
+if AUTH_AVAILABLE:
+    @app.get("/api/v1/dashboard/")
+    def get_dashboard_with_auth(user=Depends(auth_required)):
+        return get_dashboard(user)
+
+if __name__ == "__main__":
+    # Run: python main.py
+    # Tip: set HOST/PORT/RELOAD env vars as needed
+    import os
+    import uvicorn
+
+    host = os.getenv("HOST", "127.0.0.1")     # use "0.0.0.0" inside Docker/VM
+    port = int(os.getenv("PORT", "8000"))
+    reload = os.getenv("RELOAD", "1") == "1"  # turn off in prod
+
+    # For reload=True, pass an import string ("module:app") so Uvicorn can re-import.
+    # If this file is main.py at the project root, "main:app" works.
+    app_ref = "main:app" if reload else app
+
+    uvicorn.run(app_ref, host=host, port=port, reload=reload)
